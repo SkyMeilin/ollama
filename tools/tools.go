@@ -124,13 +124,20 @@ func (p *Parser) parseToolCall() *api.ToolCall {
 		return nil
 	}
 
-	var args map[string]any
+	var argsBytes json.RawMessage
 	if found, i := findArguments(tool, p.buffer); found == nil {
 		return nil
 	} else {
-		args = found
+		argsBytes = found
 		if i > end {
 			end = i
+		}
+	}
+
+	var args api.ToolCallFunctionArguments
+	if len(argsBytes) > 0 {
+		if err := json.Unmarshal(argsBytes, &args); err != nil {
+			return nil
 		}
 	}
 
@@ -213,13 +220,14 @@ func findTool(tools []api.Tool, buf []byte) (*api.Tool, int) {
 }
 
 // findArguments returns the first object that appears to be
-// arguments for the provided tool in the provided buffer,
-// returning nil if no arguments are found and the end position
+// arguments for the provided tool in the provided buffer as raw JSON bytes,
+// returning nil if no arguments are found and the end position.
+// Using json.RawMessage preserves the original JSON key order.
 // TODO (jmorganca): this does not support parsing omitted arguments
 // objects for functions that have all-optional parameters
 // e.g. `{"name": "get_conditions", "arguments": {}}` will work but
 // `{"name": "get_conditions"}` will not currently work
-func findArguments(tool *api.Tool, buffer []byte) (map[string]any, int) {
+func findArguments(tool *api.Tool, buffer []byte) (json.RawMessage, int) {
 	if len(buffer) == 0 {
 		return nil, 0
 	}
@@ -260,65 +268,18 @@ func findArguments(tool *api.Tool, buffer []byte) (map[string]any, int) {
 			if braces == 0 && start != -1 {
 				object := buffer[start : i+1]
 
-				var data map[string]any
-				if err := json.Unmarshal(object, &data); err != nil {
-					// not a valid object, keep looking
+				// Check if this is valid JSON
+				if !json.Valid(object) {
 					start = -1
 					continue
 				}
 
-				var findObject func(obj map[string]any) (map[string]any, bool)
-				findObject = func(obj map[string]any) (map[string]any, bool) {
-					findMap := func(name string, obj map[string]any) (map[string]any, bool) {
-						if args, ok := obj[name].(map[string]any); ok {
-							return args, true
-						}
-						if argsStr, ok := obj[name].(string); ok {
-							var argsData map[string]interface{}
-							if err := json.Unmarshal([]byte(argsStr), &argsData); err == nil {
-								return argsData, ok
-							}
-						}
-						return nil, false
-					}
-					if _, hasName := obj["name"]; hasName {
-						if args, ok := findMap("arguments", obj); ok {
-							return args, true
-						}
-						if args, ok := findMap("parameters", obj); ok {
-							return args, true
-						}
-						return nil, true
-					}
-					if args, ok := findMap(tool.Function.Name, obj); ok {
-						return args, true
-					}
-
-					for _, v := range obj {
-						switch child := v.(type) {
-						case map[string]any:
-							if result, found := findObject(child); found {
-								return result, true
-							}
-						case []any:
-							for _, item := range child {
-								if childObj, ok := item.(map[string]any); ok {
-									if result, found := findObject(childObj); found {
-										return result, true
-									}
-								}
-							}
-						}
-					}
-
-					return nil, false
-				}
-
-				if args, found := findObject(data); found {
+				if args, found := findArgumentsInObject(tool, object); found {
 					return args, i
 				}
 
-				return data, i
+				// Object itself might be the arguments
+				return json.RawMessage(object), i
 			}
 
 			if braces < 0 {
@@ -328,6 +289,93 @@ func findArguments(tool *api.Tool, buffer []byte) (map[string]any, int) {
 	}
 
 	return nil, 0
+}
+
+// findArgumentsInObject searches for arguments within a JSON object,
+// returning the raw bytes of the arguments if found. Using json.RawMessage
+// throughout preserves the original JSON key order.
+func findArgumentsInObject(tool *api.Tool, object []byte) (json.RawMessage, bool) {
+	// Try format with "name" key: {"name": "...", "arguments": {...}}
+	type namedFormat struct {
+		Name       string          `json:"name"`
+		Arguments  json.RawMessage `json:"arguments"`
+		Parameters json.RawMessage `json:"parameters"`
+	}
+	var named namedFormat
+	if json.Unmarshal(object, &named) == nil && named.Name != "" {
+		if len(named.Arguments) > 0 {
+			decoded := decodeRawMessage(named.Arguments)
+			// Only return if it's an object, not an array
+			if len(decoded) > 0 && decoded[0] == '{' {
+				return decoded, true
+			}
+			// Has arguments but not an object: return nil but mark as found
+			return nil, true
+		}
+		if len(named.Parameters) > 0 {
+			decoded := decodeRawMessage(named.Parameters)
+			// Only return if it's an object, not an array
+			if len(decoded) > 0 && decoded[0] == '{' {
+				return decoded, true
+			}
+			// Has parameters but not an object: return nil but mark as found
+			return nil, true
+		}
+		// Has name but no arguments
+		return nil, true
+	}
+
+	// Try format with tool name as key: {"get_weather": {...}}
+	var objMap map[string]json.RawMessage
+	if json.Unmarshal(object, &objMap) == nil {
+		if args, ok := objMap[tool.Function.Name]; ok {
+			decoded := decodeRawMessage(args)
+			// Only return if it's an object, not an array
+			if len(decoded) > 0 && decoded[0] == '{' {
+				return decoded, true
+			}
+			return nil, true
+		}
+	}
+
+	// Recursive search through children
+	if objMap == nil {
+		return nil, false
+	}
+
+	for _, v := range objMap {
+		// Check if this value is an object
+		if len(v) > 0 && v[0] == '{' {
+			if args, found := findArgumentsInObject(tool, v); found {
+				return args, true
+			}
+		}
+		// Check if this value is an array
+		if len(v) > 0 && v[0] == '[' {
+			var arr []json.RawMessage
+			if json.Unmarshal(v, &arr) == nil {
+				for _, item := range arr {
+					if len(item) > 0 && item[0] == '{' {
+						if args, found := findArgumentsInObject(tool, item); found {
+							return args, true
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return nil, false
+}
+
+// decodeRawMessage handles the case where arguments might be a JSON string
+// (double-encoded JSON) and returns the inner content if so
+func decodeRawMessage(raw json.RawMessage) json.RawMessage {
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return json.RawMessage(s)
+	}
+	return raw
 }
 
 // done checks if the parser is done parsing by looking
